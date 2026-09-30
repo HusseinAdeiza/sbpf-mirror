@@ -26,7 +26,7 @@ use solana_sbpf::{
     program::{BuiltinFunctionDefinition, BuiltinProgram, FunctionRegistry, SBPFVersion},
     static_analysis::Analysis,
     verifier::RequisiteVerifier,
-    vm::{Config, ContextObject},
+    vm::{Config, ContextObject, ExecutionMode},
 };
 use std::{fs::File, io::Read, sync::Arc};
 use test_utils::{
@@ -2491,6 +2491,61 @@ fn test_nested_vm_syscall() {
 }
 
 // Instruction Meter Limit
+
+#[test]
+fn test_due_insn_count_on_exceeded_max_instructions() {
+    let source = "
+        add64 r10, 0
+        jsge r0, r0, -1
+        exit";
+    let executable = assemble(
+        source,
+        Arc::new(BuiltinProgram::new_loader(Config::default())),
+    )
+    .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    executable.jit_compile().unwrap();
+
+    for budget in [5u64, 17, 100] {
+        let mut context_object = TestContextObject::new(budget);
+        let mut call_frames =
+            vec![solana_sbpf::vm::CallFrame::default(); executable.get_config().max_call_depth];
+        create_vm!(
+            vm,
+            &executable,
+            &mut context_object,
+            stack,
+            heap,
+            vec![],
+            None
+        );
+        vm.execute_program(
+            &executable,
+            &mut ExecutionMode::Interpreted,
+            &mut call_frames,
+        );
+        assert_eq!(
+            vm.due_insn_count, budget,
+            "interpreter did not consume the whole budget"
+        );
+
+        let mut context_object = TestContextObject::new(budget);
+        create_vm!(
+            vm,
+            &executable,
+            &mut context_object,
+            stack,
+            heap,
+            vec![],
+            None
+        );
+        vm.execute_program(&executable, &mut ExecutionMode::Jit, &mut []);
+        assert_eq!(
+            vm.due_insn_count, budget,
+            "JIT did not consume the whole budget"
+        );
+    }
+}
 
 #[test]
 fn test_tight_infinite_loop_conditional() {

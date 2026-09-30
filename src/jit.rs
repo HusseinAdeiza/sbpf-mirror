@@ -236,6 +236,7 @@ const ANCHOR_CALL_UNSUPPORTED_INSTRUCTION: usize = 11;
 const ANCHOR_EXTERNAL_FUNCTION_CALL: usize = 12;
 const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 13;
 const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
+const ANCHOR_EPILOGUE_NO_INSTRUCTION_METER: usize = 15;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
 const ANCHOR_COUNT: usize = 34; // Update me when adding or removing anchors
 
@@ -1501,6 +1502,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 3, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER = -REGISTER_INSTRUCTION_METER;
             self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::DueInsnCount)))); // *DueInsnCount = REGISTER_INSTRUCTION_METER;
         }
+        self.set_anchor(ANCHOR_EPILOGUE_NO_INSTRUCTION_METER);
         // Print stop watch value
         fn stopwatch_result(numerator: u64, denominator: u64) {
             println!("Stop watch: {} / {} = {}", numerator, denominator, if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 });
@@ -1518,8 +1520,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Handler for EbpfError::ExceededMaxInstructions
         self.set_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS);
         self.emit_set_exception_kind(EbpfError::ExceededMaxInstructions);
-        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_SCRATCH)); // REGISTER_SCRATCH = REGISTER_INSTRUCTION_METER;
-        // Fall through
+        if self.config.enable_instruction_meter {
+            // The budget is fully exhausted, so *DueInsnCount = *PreviousInstructionMeter.
+            // Deriving it in the epilogue would require REGISTER_SCRATCH to hold the pc,
+            // which this path does not have, so write the counter directly here and skip
+            // the instruction meter accounting of the epilogue.
+            self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::Registers) + 11 * std::mem::size_of::<u64>() as i32))); // registers[11] = pc;
+            self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_INSTRUCTION_METER, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter)))); // REGISTER_INSTRUCTION_METER = *PreviousInstructionMeter;
+            self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::DueInsnCount)))); // *DueInsnCount = REGISTER_INSTRUCTION_METER;
+            self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_EPILOGUE_NO_INSTRUCTION_METER, 5)));
+        }
 
         // Epilogue for errors
         self.set_anchor(ANCHOR_THROW_EXCEPTION_UNCHECKED);
